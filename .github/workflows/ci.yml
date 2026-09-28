@@ -43,7 +43,7 @@ jobs:
           # forgesworn/signet-contacts-conformance, running
           # `git rev-parse origin/main`, and updating both this SHA and the
           # date below. Do not point this at `main`: see the header comment.
-          ref: 7f9f097102c4108d498c4c3b09b22630eb9fc64b # conformance main @ 2026-09-28
+          ref: 2f740ee06ca3d529a26d322ef7169fa69b9137ca # conformance main @ 2026-09-28
           path: .conformance
           persist-credentials: false
       - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1

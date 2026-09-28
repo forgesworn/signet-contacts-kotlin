@@ -152,22 +152,33 @@ every trap. Where this port knowingly differs from the reference:
 
 - A field the reference checks with `Number.isInteger` must here be a safe
   integer (at most 2^53 - 1). Only values above 2^53 are affected.
-- UTS #46 is not implemented: a non-ASCII relay host (after percent-decoding)
-  goes through `java.net.IDN` (IDNA 2003) with no flags, which agrees with
-  UTS #46 nontransitional processing for ordinary hosts. A host containing
-  U+00DF (ß), U+03C2 (ς), U+200C (ZWNJ) or U+200D (ZWJ) - exactly where IDNA
-  2003 and UTS #46 disagree - is rejected outright until UTS #46 is
-  implemented. With no flags passed, a code point unassigned in Unicode 3.2
-  is also rejected rather than let through. Android's `java.net.IDN` is
-  ICU-backed, so results for other exotic inputs may still rarely differ from
-  a desktop JVM's; the deviation-character and unassigned-code-point
-  rejections apply identically on both. An `xn--...` (Punycode) label is
-  accepted only once a real RFC 3492 decoder confirms it actually decodes -
-  and that check runs over IDN's OWN output too, not only over an
+- UTS #46 is not implemented, so relay-host handling branches on whether the
+  percent-decoded host is pure ASCII, matching the reference (Node's URL
+  implementation takes an ASCII fast path). A pure-ASCII host is only
+  lowercased and its `xn--` labels are never Punycode-validated - an
+  already-ASCII malformed `xn--` label (e.g. `xn--999999999`, `xn---abc`,
+  `xn--abc-`, `xn--`) is kept verbatim, same as the reference.
+  A host containing any non-ASCII code point instead goes through
+  `java.net.IDN` (IDNA 2003) with no flags, which agrees with UTS #46
+  nontransitional processing for ordinary hosts. A host containing U+00DF
+  (ß), U+03C2 (ς), U+200C (ZWNJ) or U+200D (ZWJ) - exactly where IDNA 2003
+  and UTS #46 disagree - is rejected outright until UTS #46 is implemented.
+  With no flags passed, a code point unassigned in Unicode 3.2 is also
+  rejected rather than let through. Android's `java.net.IDN` is ICU-backed,
+  so results for other exotic inputs may still rarely differ from a desktop
+  JVM's; the deviation-character and unassigned-code-point rejections apply
+  identically on both. On this non-ASCII path, an `xn--...` (Punycode) label
+  is accepted only once a real RFC 3492 decoder confirms it actually
+  decodes - and that check runs over IDN's OWN output too, not only over an
   already-ASCII input, since `java.net.IDN` passes an ASCII `xn--` label
   straight through unchecked even when another label in the same host forces
-  the domain onto the non-ASCII path. ASCII, IPv4 and IPv6 hosts otherwise
-  follow the standard exactly.
+  the domain onto the non-ASCII path. IPv4 and IPv6 hosts otherwise follow
+  the standard exactly. The conformance repository's `invite.json` lists
+  four known-divergent invite cases from this deviation-character and
+  unassigned-code-point gap (`relay "wss://faß.de/"`,
+  `relay "wss://ς.example/"`, `relay "wss://ẞ.example/"` and
+  `relay "wss://%C3%9F.example/"`); `ConformanceTest`'s `cases - invite`
+  test carries the matching `knownInviteDivergences` list.
 - A check record's `method` must be a string; the reference also accepts a
   one-element array that stringifies to a valid method.
 

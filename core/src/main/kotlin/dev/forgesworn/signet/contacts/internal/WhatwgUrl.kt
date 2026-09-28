@@ -11,8 +11,20 @@ package dev.forgesworn.signet.contacts.internal
  * callers need: they accept exactly one scheme each and reject the rest.
  *
  * Known gap: UTS #46 (the standard's own IDNA processing) is not
- * implemented. A non-ASCII host, after percent-decoding, instead goes
- * through `java.net.IDN` (IDNA 2003) with no flags, which agrees with UTS #46
+ * implemented. Host handling instead branches on whether the percent-decoded
+ * host is pure ASCII, which is exactly what the reference does: Node's URL
+ * implementation takes an ASCII fast path through `domain to ASCII` that
+ * only lowercases the host, while any non-ASCII host runs full UTS #46
+ * processing. That means a pure-ASCII host is lowercased and NOT run through
+ * Punycode validation at all - an already-ASCII `xn--` label is kept
+ * verbatim even when it is malformed (e.g. `xn--999999999.example`,
+ * `xn---abc.example`, `xn--abc-.example`, `xn--.example`), because the
+ * reference's fast path never decodes it either. This is harmless: such a
+ * host cannot resolve, but a port must match the reference byte-for-byte
+ * since the normalised href is hashed into every exchange transcript.
+ *
+ * A host containing any non-ASCII character instead goes through
+ * `java.net.IDN` (IDNA 2003) with no flags, which agrees with UTS #46
  * nontransitional processing for ordinary hosts. It disagrees on exactly
  * four "deviation" characters (U+00DF ß, U+03C2 ς, U+200C ZWNJ, U+200D ZWJ),
  * so a host containing any of those is rejected outright rather than risk
@@ -22,13 +34,13 @@ package dev.forgesworn.signet.contacts.internal
  * via `ALLOW_UNASSIGNED`. Android's `java.net.IDN` is ICU-backed, so results
  * for exotic (non-deviation) inputs may still differ in rare cases from a
  * desktop JVM's; the deviation-character and unassigned-code-point
- * rejections themselves apply identically on both. An `xn--...` (Punycode)
- * label - whether it arrived already-ASCII or came out of `java.net.IDN`,
- * which passes an ASCII label through unchecked - is accepted only once a
- * real RFC 3492 decoder confirms it actually decodes; `java.net.IDN.toUnicode`
- * never throws, so it could not be trusted to reject a malformed one. ASCII
- * hosts, IPv4 (including the hex and octal forms) and IPv6 follow the
- * standard exactly.
+ * rejections themselves apply identically on both. On this non-ASCII path,
+ * an `xn--...` (Punycode) label - whether it arrived already-ASCII or came
+ * out of `java.net.IDN`, which passes an ASCII label through unchecked - is
+ * accepted only once a real RFC 3492 decoder confirms it actually decodes;
+ * `java.net.IDN.toUnicode` never throws, so it could not be trusted to
+ * reject a malformed one. IPv4 (including the hex and octal forms) and IPv6
+ * follow the standard exactly.
  */
 internal class WhatwgUrl private constructor(
     val scheme: String,
@@ -261,36 +273,46 @@ internal class WhatwgUrl private constructor(
         private val UTS46_DEVIATION_CHARS = charArrayOf('ß', 'ς', '‌', '‍')
 
         private fun domainToAscii(domain: String): String {
+            if (domain.none { it.code > 0x7f }) {
+                // Pure-ASCII fast path, matching the reference (Node's URL
+                // implementation): only lowercase. Do NOT validate "xn--"
+                // labels here - the reference never decodes them on this
+                // path either, so a malformed one (e.g. "xn--999999999",
+                // "xn---abc", "xn--abc-", "xn--") is kept verbatim. Such a
+                // host cannot resolve, so this is harmless, but a port must
+                // match the reference byte-for-byte since the normalised
+                // href is hashed into every exchange transcript.
+                return domain.lowercase(java.util.Locale.ROOT)
+            }
             // Fail closed on exactly the four characters IDNA 2003 and UTS #46
             // disagree on, regardless of what else is in the host.
             if (domain.any { it in UTS46_DEVIATION_CHARS }) fail()
-            if (domain.any { it.code > 0x7f }) {
-                // UTS #46 is not implemented (see the class doc): a non-ASCII host
-                // goes through java.net.IDN with NO flags, so it is fail-closed on
-                // code points unassigned in Unicode 3.2 (IllegalArgumentException)
-                // rather than letting ALLOW_UNASSIGNED pass them through.
-                val ascii = try {
-                    java.net.IDN.toASCII(domain, 0).lowercase(java.util.Locale.ROOT)
-                } catch (_: IllegalArgumentException) {
-                    fail()
-                }
-                // IDN passes an ASCII "xn--" label straight through unchecked, so
-                // the same Punycode-must-actually-decode validation below has to
-                // run over ITS output too, not only over an input that arrived
-                // already all-ASCII.
-                validateXnLabels(ascii)
-                return ascii
+            // UTS #46 is not implemented (see the class doc): a non-ASCII host
+            // goes through java.net.IDN with NO flags, so it is fail-closed on
+            // code points unassigned in Unicode 3.2 (IllegalArgumentException)
+            // rather than letting ALLOW_UNASSIGNED pass them through.
+            val ascii = try {
+                java.net.IDN.toASCII(domain, 0).lowercase(java.util.Locale.ROOT)
+            } catch (_: IllegalArgumentException) {
+                fail()
             }
-            val lower = domain.lowercase(java.util.Locale.ROOT)
-            validateXnLabels(lower)
-            return lower
+            // IDN passes an ASCII "xn--" label straight through unchecked, so
+            // the same Punycode-must-actually-decode validation below has to
+            // run over ITS output too, not only over an input that arrived
+            // already all-ASCII. This only runs on the non-ASCII path: a
+            // pure-ASCII host is never Punycode-validated (see above).
+            validateXnLabels(ascii)
+            return ascii
         }
 
         /** A label that claims to be Punycode ("xn--") must actually decode as
          *  Punycode. `java.net.IDN.toUnicode` never throws, so only a real RFC
          *  3492 decoder can reject a malformed one - and IDN also passes an
          *  already-ASCII "xn--" label straight through unchecked, so this must
-         *  run over both an ASCII host's own labels and an IDN-converted one's. */
+         *  run over both an IDN input's own already-ASCII labels and its
+         *  IDN-converted ones. Only called on the non-ASCII host path: a
+         *  pure-ASCII host's "xn--" labels are kept verbatim, unvalidated,
+         *  matching the reference (see [domainToAscii] and the class doc). */
         private fun validateXnLabels(asciiDomain: String) {
             for (label in asciiDomain.split('.')) {
                 if (label.startsWith("xn--")) {
