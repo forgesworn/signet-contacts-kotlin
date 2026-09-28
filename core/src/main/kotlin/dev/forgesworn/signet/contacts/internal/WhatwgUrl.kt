@@ -10,10 +10,25 @@ package dev.forgesworn.signet.contacts.internal
  * implementations. Every other scheme returns null here, which is what both
  * callers need: they accept exactly one scheme each and reject the rest.
  *
- * Known gap: internationalised domain names go through `java.net.IDN`
- * (IDNA 2003) rather than UTS #46, so a non-ASCII host can normalise
- * differently from a browser in rare cases. ASCII hosts, IPv4 (including the
- * hex and octal forms) and IPv6 follow the standard exactly.
+ * Known gap: UTS #46 (the standard's own IDNA processing) is not
+ * implemented. A non-ASCII host, after percent-decoding, instead goes
+ * through `java.net.IDN` (IDNA 2003) with no flags, which agrees with UTS #46
+ * nontransitional processing for ordinary hosts. It disagrees on exactly
+ * four "deviation" characters (U+00DF ß, U+03C2 ς, U+200C ZWNJ, U+200D ZWJ),
+ * so a host containing any of those is rejected outright rather than risk
+ * normalising to something a real UTS #46 implementation would not. With no
+ * flags passed, `java.net.IDN` is also fail-closed on a code point unassigned
+ * in Unicode 3.2 (`IllegalArgumentException`), rather than letting it through
+ * via `ALLOW_UNASSIGNED`. Android's `java.net.IDN` is ICU-backed, so results
+ * for exotic (non-deviation) inputs may still differ in rare cases from a
+ * desktop JVM's; the deviation-character and unassigned-code-point
+ * rejections themselves apply identically on both. An `xn--...` (Punycode)
+ * label - whether it arrived already-ASCII or came out of `java.net.IDN`,
+ * which passes an ASCII label through unchecked - is accepted only once a
+ * real RFC 3492 decoder confirms it actually decodes; `java.net.IDN.toUnicode`
+ * never throws, so it could not be trusted to reject a malformed one. ASCII
+ * hosts, IPv4 (including the hex and octal forms) and IPv6 follow the
+ * standard exactly.
  */
 internal class WhatwgUrl private constructor(
     val scheme: String,
@@ -241,26 +256,142 @@ internal class WhatwgUrl private constructor(
             return Js.utf8Decode(out.toByteArray(), stripBom = false)
         }
 
+        // The four code points where IDNA 2003 (java.net.IDN) disagrees with
+        // UTS #46 nontransitional processing: see the class doc.
+        private val UTS46_DEVIATION_CHARS = charArrayOf('ß', 'ς', '‌', '‍')
+
         private fun domainToAscii(domain: String): String {
-            if (domain.all { it.code < 0x80 }) {
-                val lower = domain.lowercase(java.util.Locale.ROOT)
-                // A label that claims to be Punycode must decode as Punycode.
-                for (label in lower.split('.')) {
-                    if (label.startsWith("xn--") && label.length > 4) {
-                        try {
-                            java.net.IDN.toUnicode(label, java.net.IDN.ALLOW_UNASSIGNED)
-                        } catch (_: IllegalArgumentException) {
-                            fail()
-                        }
-                    }
+            // Fail closed on exactly the four characters IDNA 2003 and UTS #46
+            // disagree on, regardless of what else is in the host.
+            if (domain.any { it in UTS46_DEVIATION_CHARS }) fail()
+            if (domain.any { it.code > 0x7f }) {
+                // UTS #46 is not implemented (see the class doc): a non-ASCII host
+                // goes through java.net.IDN with NO flags, so it is fail-closed on
+                // code points unassigned in Unicode 3.2 (IllegalArgumentException)
+                // rather than letting ALLOW_UNASSIGNED pass them through.
+                val ascii = try {
+                    java.net.IDN.toASCII(domain, 0).lowercase(java.util.Locale.ROOT)
+                } catch (_: IllegalArgumentException) {
+                    fail()
                 }
-                return lower
+                // IDN passes an ASCII "xn--" label straight through unchecked, so
+                // the same Punycode-must-actually-decode validation below has to
+                // run over ITS output too, not only over an input that arrived
+                // already all-ASCII.
+                validateXnLabels(ascii)
+                return ascii
             }
-            return try {
-                java.net.IDN.toASCII(domain, java.net.IDN.ALLOW_UNASSIGNED).lowercase(java.util.Locale.ROOT)
-            } catch (_: IllegalArgumentException) {
-                fail()
+            val lower = domain.lowercase(java.util.Locale.ROOT)
+            validateXnLabels(lower)
+            return lower
+        }
+
+        /** A label that claims to be Punycode ("xn--") must actually decode as
+         *  Punycode. `java.net.IDN.toUnicode` never throws, so only a real RFC
+         *  3492 decoder can reject a malformed one - and IDN also passes an
+         *  already-ASCII "xn--" label straight through unchecked, so this must
+         *  run over both an ASCII host's own labels and an IDN-converted one's. */
+        private fun validateXnLabels(asciiDomain: String) {
+            for (label in asciiDomain.split('.')) {
+                if (label.startsWith("xn--")) {
+                    if (decodePunycode(label.substring(4)).isNullOrEmpty()) fail()
+                }
             }
+        }
+
+        // ------------------------------------------------------------------
+        // Punycode (RFC 3492), decode only: this file only ever needs to
+        // confirm an "xn--" label decodes at all, never to encode one.
+        // ------------------------------------------------------------------
+
+        private const val PUNYCODE_BASE = 36
+        private const val PUNYCODE_TMIN = 1
+        private const val PUNYCODE_TMAX = 26
+        private const val PUNYCODE_SKEW = 38
+        private const val PUNYCODE_DAMP = 700
+        private const val PUNYCODE_INITIAL_BIAS = 72
+        private const val PUNYCODE_INITIAL_N = 128
+
+        private fun punycodeDigit(cp: Int): Int = when (cp) {
+            in 'a'.code..'z'.code -> cp - 'a'.code
+            in 'A'.code..'Z'.code -> cp - 'A'.code
+            in '0'.code..'9'.code -> cp - '0'.code + 26
+            else -> -1
+        }
+
+        private fun punycodeAdapt(delta0: Int, numPoints: Int, firstTime: Boolean): Int {
+            var delta = if (firstTime) delta0 / PUNYCODE_DAMP else delta0 / 2
+            delta += delta / numPoints
+            var k = 0
+            while (delta > ((PUNYCODE_BASE - PUNYCODE_TMIN) * PUNYCODE_TMAX) / 2) {
+                delta /= (PUNYCODE_BASE - PUNYCODE_TMIN)
+                k += PUNYCODE_BASE
+            }
+            return k + (((PUNYCODE_BASE - PUNYCODE_TMIN + 1) * delta) / (delta + PUNYCODE_SKEW))
+        }
+
+        /**
+         * Decode [input] (an "xn--" label with that prefix already stripped)
+         * per RFC 3492. Null on any malformed input: an out-of-alphabet
+         * digit, an overflowed generalised variable-length integer, or a
+         * resulting code point outside the valid Unicode range. An empty
+         * [input] decodes to an empty string, which the caller treats as
+         * invalid (a bare "xn--" label is not a real Punycode label).
+         */
+        private fun decodePunycode(input: String): String? {
+            var n = PUNYCODE_INITIAL_N
+            var i = 0
+            var bias = PUNYCODE_INITIAL_BIAS
+            val output = ArrayList<Int>()
+
+            val lastDelimiter = input.lastIndexOf('-')
+            // RFC 3492 6.2: a delimiter at index 0 ("-abc") means the basic part is
+            // EMPTY, and decoding starts at index 0 - the delimiter itself is not a
+            // valid digit, so decoding fails there rather than skipping past it.
+            if (lastDelimiter > 0) {
+                for (k in 0 until lastDelimiter) {
+                    val cp = input[k].code
+                    if (cp >= 0x80) return null // a basic code point must be ASCII
+                    output.add(cp)
+                }
+            }
+            var pos: Int = if (lastDelimiter > 0) lastDelimiter + 1 else 0
+
+            while (pos < input.length) {
+                val oldI = i
+                var w = 1
+                var k = PUNYCODE_BASE
+                while (true) {
+                    if (pos >= input.length) return null
+                    val digit = punycodeDigit(input[pos].code)
+                    pos++
+                    if (digit < 0) return null
+                    if (digit > (Int.MAX_VALUE - i) / w) return null // overflow
+                    i += digit * w
+                    val t = when {
+                        k <= bias -> PUNYCODE_TMIN
+                        k >= bias + PUNYCODE_TMAX -> PUNYCODE_TMAX
+                        else -> k - bias
+                    }
+                    if (digit < t) break
+                    if (w > Int.MAX_VALUE / (PUNYCODE_BASE - t)) return null // overflow
+                    w *= (PUNYCODE_BASE - t)
+                    k += PUNYCODE_BASE
+                }
+                val outLength = output.size + 1
+                bias = punycodeAdapt(i - oldI, outLength, oldI == 0)
+                if (i / outLength > Int.MAX_VALUE - n) return null // overflow
+                n += i / outLength
+                i %= outLength
+                if (n > 0x10ffff || n in 0xd800..0xdfff) return null // outside the valid Unicode range
+                output.add(i, n)
+                i++
+            }
+            // UTS #46: a Punycode label that decodes to purely ASCII output (e.g.
+            // "xn--abc-") is invalid - there is no reason to Punycode-encode a
+            // string with nothing non-ASCII in it.
+            if (output.all { it < 0x80 }) return null
+            return buildString { for (cp in output) appendCodePoint(cp) }
         }
 
         private fun endsInANumber(host: String): Boolean {

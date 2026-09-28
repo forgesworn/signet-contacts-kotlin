@@ -31,15 +31,19 @@ import dev.forgesworn.signet.contacts.wire.projectionEventTemplate
 import dev.forgesworn.signet.contacts.wire.projectionTag
 import dev.forgesworn.signet.contacts.wire.proposalTag
 import dev.forgesworn.signet.contacts.wire.storedAckEventTemplate
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.currentTime
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.withTimeout
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
@@ -75,6 +79,14 @@ class SignetContactsClientTest {
         asSigned(storedAckEventTemplate(ephemeralPubkey, APP, createdAt, content, challenge), id, sig)
 
     private fun hasKind(filter: NostrFilter, kind: Int): Boolean = filter.kinds?.contains(kind) == true
+
+    // Hoisted out of the crowding test below: an inline `sortedByDescending`
+    // nested inside that test's lambdas generates a compiler class-file name
+    // long enough to break on an ecryptfs home directory (its encoding of a
+    // filename over 143 chars is rejected outright). Keeping the sort as its
+    // own named function, rather than inlined at the call site, keeps the
+    // generated class name short regardless of which test calls it.
+    private fun newestFirst(events: List<SignedNostrEvent>): List<SignedNostrEvent> = events.sortedByDescending { it.createdAt }
 
     // ------------------------------------------------------------------
     // awaitPairingAck
@@ -221,7 +233,7 @@ class SignetContactsClientTest {
     // in front of the genuine (older) ack, a poll that only asks for the
     // newest page would never see it; the fix pages backward with `until`.
     @Test
-    fun `pages back past a crowd of newer junk stored acks to reach an older genuine one (crowding)`() = runTest {
+    fun `pages back past a wall of newer junk to reach the genuine stored ack (crowding)`() = runTest {
         val signer = FakeSigner()
         val base = 1_700_000_000L
         val genuineContent = signer.nip44Encrypt(APP, ackPlaintext())
@@ -234,7 +246,7 @@ class SignetContactsClientTest {
         relay.fetchManyImpl = { filter, _, _ ->
             if (!hasKind(filter, ACK_STORED_KIND)) emptyList() else {
                 val until = filter.until ?: Long.MAX_VALUE
-                allStored.filter { it.createdAt <= until }.sortedByDescending { it.createdAt }.take(ACK_CANDIDATE_LIMIT)
+                newestFirst(allStored.filter { it.createdAt <= until }).take(ACK_CANDIDATE_LIMIT)
             }
         }
         val client = SignetContactsClient(signer, relay, now = { base }, elapsedMs = { testScheduler.currentTime })
@@ -569,6 +581,30 @@ class SignetContactsClientTest {
         assertEquals(1, onRevokedCalls)
     }
 
+    // Regression: an onRevoked listener used to fire while `lock` was still
+    // held by the ingest that triggered it. A listener that calls back into
+    // another method taking the same lock - `load` here, reached through
+    // `runBlocking` since the callback type is not itself `suspend` -
+    // deadlocked: `load` could never acquire a lock its own caller was still
+    // holding. The listener now fires only after that lock is released, so
+    // this completes well inside the timeout instead of hanging forever.
+    @Test
+    fun `an onRevoked listener that calls back into load via runBlocking does not deadlock`() = runBlocking {
+        val signer = FakeSigner()
+        val content = sealProjection(signer, testProjection(contacts = emptyList(), revoked = true))
+        val relay = FakeRelay()
+        relay.fetchNewestImpl = { _, _, _ -> signed(projectionEventTemplate(RAIL, GRANT, 1_700_000_000, content)) }
+        val client = SignetContactsClient(signer, relay, now = { 1_700_000_100 })
+        var loadedGrantId: String? = null
+        client.onRevoked {
+            runBlocking { loadedGrantId = client.load(GRANT).grantId }
+        }
+        withTimeout(5_000) {
+            client.fetchProjection(PAIRING)
+        }
+        assertEquals(GRANT, loadedGrantId)
+    }
+
     @Test
     fun `polls when the transport cannot subscribe, and stops polling on stop`() = runTest {
         val signer = FakeSigner()
@@ -686,6 +722,93 @@ class SignetContactsClientTest {
         client.stop()
         client.stop()
         assertEquals(1, closeCalls[1])
+    }
+
+    // A closed client must never open another subscription: with a caller-owned
+    // scope already gone (or about to be), a subscription opened after `close()`
+    // would leak - nothing is left running to ever tear it down.
+    @Test
+    fun `start after close throws and never touches the relay`() = runTest {
+        var subscribeCalls = 0
+        val relay = FakeRelay()
+        relay.subscribeImpl = { _, _, _ -> subscribeCalls++; RelaySubscription {} }
+        val client = SignetContactsClient(FakeSigner(), relay, elapsedMs = { testScheduler.currentTime }, scope = backgroundScope)
+        client.close()
+        assertFailsWith<IllegalStateException> { client.start(PAIRING, pollMs = 60_000) }
+        assertEquals(0, subscribeCalls)
+    }
+
+    // A suspended ingest (e.g. a slow decrypt) that is still in flight when
+    // `stop()` runs must not go on to write `state` once it is eventually
+    // unblocked: `stop()` cancels the run's job, which cancels every ingest
+    // launched under it, live push or poll alike.
+    @Test
+    fun `stop cancels an in-flight ingest so it cannot write state after the fact`() = runTest {
+        val signer = FakeSigner()
+        val content = sealProjection(signer, testProjection())
+        val gate = CompletableDeferred<Unit>()
+        val realDecrypt = signer.decryptImpl
+        signer.decryptImpl = { peer, ciphertext -> gate.await(); realDecrypt(peer, ciphertext) }
+        var push: ((SignedNostrEvent) -> Unit)? = null
+        var onRevokedCalls = 0
+        val storage = MemoryStorage()
+        val relay = FakeRelay()
+        relay.subscribeImpl = { _, _, onEvent -> push = onEvent; RelaySubscription {} }
+        val client = SignetContactsClient(signer, relay, storage = storage, now = { 1_700_000_100 }, elapsedMs = { testScheduler.currentTime }, scope = backgroundScope)
+        client.onRevoked { onRevokedCalls++ }
+        client.start(PAIRING, pollMs = 60_000)
+        push!!(signed(projectionEventTemplate(RAIL, GRANT, 1_700_000_000, content)))
+        runCurrent() // the ingest starts and suspends inside the mutex, waiting on `gate`
+        client.stop() // cancels the still-suspended ingest
+        runCurrent()
+        gate.complete(Unit) // unblocks a coroutine that, by now, is already cancelled
+        runCurrent()
+        assertNull(client.getState().projection)
+        assertEquals(0, onRevokedCalls)
+        assertNull(storage.get(stateKey(GRANT)))
+    }
+
+    // A commit that has already passed its final cancellation check (immediately
+    // before it writes `state`) must land in full even when `stop()` cancels the
+    // run while it is still suspended persisting - never a torn commit (state
+    // updated but storage or the revocation announcement missing, or any other
+    // partial mix). Gates the SECOND storage write (persistPending) so the first
+    // (persistState) has already gone through by the time `stop()` runs, proving
+    // the in-progress commit is not itself interrupted partway.
+    @Test
+    fun `commit begun before stop is atomic - state, both storage keys and the listener land together`() = runTest {
+        val signer = FakeSigner()
+        val content = sealProjection(signer, testProjection(contacts = emptyList(), revoked = true))
+        val gate = CompletableDeferred<Unit>()
+        val map = mutableMapOf<String, String>()
+        var setCalls = 0
+        val storage = object : StorageIo {
+            override suspend fun get(key: String): String? = map[key]
+            override suspend fun set(key: String, value: String) {
+                setCalls++
+                if (setCalls == 2) gate.await() // suspend persistPending's write, mid-commit
+                map[key] = value
+            }
+        }
+        var push: ((SignedNostrEvent) -> Unit)? = null
+        var onRevokedCalls = 0
+        val relay = FakeRelay()
+        relay.subscribeImpl = { _, _, onEvent -> push = onEvent; RelaySubscription {} }
+        val client = SignetContactsClient(signer, relay, storage = storage, now = { 1_700_000_100 }, elapsedMs = { testScheduler.currentTime }, scope = backgroundScope)
+        client.onRevoked { onRevokedCalls++ }
+        client.start(PAIRING, pollMs = 60_000)
+        push!!(signed(projectionEventTemplate(RAIL, GRANT, 1_700_000_000, content)))
+        runCurrent() // the ingest passes its final ensureActive() check, commits `state`,
+        // persists it, and suspends on `gate` while persisting `pending`
+        client.stop() // cancels the run; the commit is already underway and must finish
+        runCurrent()
+        assertTrue(client.getState().revoked) // the in-memory commit already landed
+        assertNotNull(map[stateKey(GRANT)]) // and so did its storage write
+        gate.complete(Unit)
+        runCurrent()
+        // Once unblocked, the REST of the same commit lands too: never left partial.
+        assertNotNull(map[pendingKey(GRANT)])
+        assertEquals(1, onRevokedCalls)
     }
 
     @Test

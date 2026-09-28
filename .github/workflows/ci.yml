@@ -1,8 +1,18 @@
 name: CI
 
-# Builds the port and runs every test, including the full conformance suite
-# from forgesworn/signet-contacts-conformance main. A conformance mismatch
-# fails the build; so does a missing vectors checkout.
+# `test` builds the port and runs every test, including the full conformance
+# suite, against a PINNED commit of forgesworn/signet-contacts-conformance
+# (see the `ref:` below): a PR's pass/fail must depend only on this repo's
+# own diff, never on an unrelated same-day change landing upstream in the
+# reference vectors. A conformance mismatch fails the build; so does a
+# missing vectors checkout.
+#
+# `conformance-drift` runs the same build against conformance's `main`, on a
+# schedule and on repository_dispatch only, and FAILS the run (no
+# continue-on-error) when this port has drifted from the latest reference
+# vectors - it never blocks push/pull_request (excluded above), but a
+# scheduled or dispatched run must go red so drift is actually noticed
+# before the next deliberate pin bump, not silently ignored.
 
 on:
   push:
@@ -20,6 +30,36 @@ permissions:
 
 jobs:
   test:
+    if: github.event_name != 'schedule' && github.event_name != 'repository_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          repository: forgesworn/signet-contacts-conformance
+          # Pinned deliberately - bump by checking out
+          # forgesworn/signet-contacts-conformance, running
+          # `git rev-parse origin/main`, and updating both this SHA and the
+          # date below. Do not point this at `main`: see the header comment.
+          ref: 7f9f097102c4108d498c4c3b09b22630eb9fc64b # conformance main @ 2026-09-28
+          path: .conformance
+          persist-credentials: false
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: gradle/actions/setup-gradle@9c971963bec38e04b3d30dcc455b5382be2fdbfb # v6.3.0
+      - name: Build and test against the conformance vectors
+        run: ./gradlew build -PsignetContactsVectors=.conformance/vectors
+      - name: Record the conformance commit tested
+        if: always()
+        run: echo "Conformance vectors at $(git -C .conformance rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+
+  conformance-drift:
+    name: conformance drift (vs conformance main)
+    if: github.event_name == 'schedule' || github.event_name == 'repository_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -36,7 +76,7 @@ jobs:
           distribution: temurin
           java-version: '21'
       - uses: gradle/actions/setup-gradle@9c971963bec38e04b3d30dcc455b5382be2fdbfb # v6.3.0
-      - name: Build and test against the conformance vectors
+      - name: Build and test against the LATEST conformance vectors
         run: ./gradlew build -PsignetContactsVectors=.conformance/vectors
       - name: Record the conformance commit tested
         if: always()

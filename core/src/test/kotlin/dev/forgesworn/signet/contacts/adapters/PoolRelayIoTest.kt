@@ -48,7 +48,7 @@ class PoolRelayIoTest {
     @Test
     fun `maps fetchNewest onto pool_get and pins the author`() = runTest {
         val pool = FakePool(getImpl = { _, _ -> event })
-        val io = PoolRelayIo(pool)
+        val io = PoolRelayIo(pool, verify = { true })
         assertEquals(event, io.fetchNewest(NostrFilter(kinds = listOf(30078)), listOf("wss://r.example"), event.pubkey))
         assertEquals("wss://r.example" to NostrFilter(kinds = listOf(30078)), pool.getCalls[0])
         assertNull(io.fetchNewest(NostrFilter(kinds = listOf(30078)), listOf("wss://r.example"), "c".repeat(64)))
@@ -61,7 +61,7 @@ class PoolRelayIoTest {
     @Test
     fun `returns null when the pool throws`() = runTest {
         val pool = FakePool(getImpl = { _, _ -> throw RuntimeException("offline") })
-        val io = PoolRelayIo(pool)
+        val io = PoolRelayIo(pool, verify = { true })
         assertNull(io.fetchNewest(NostrFilter(kinds = listOf(30078)), listOf("wss://r.example")))
     }
 
@@ -71,7 +71,7 @@ class PoolRelayIoTest {
         val newer = event.copy(id = "2".repeat(64), createdAt = 20)
         var queryCalls = 0
         val pool = FakePool(queryImpl = { _, _ -> queryCalls++; listOf(older, newer, newer.copy()) })
-        val io = PoolRelayIo(pool)
+        val io = PoolRelayIo(pool, verify = { true })
         val many = io.fetchMany(NostrFilter(kinds = listOf(21237), limit = 10), listOf("wss://r.example"))
         assertEquals(listOf(newer.id, older.id), many.map { it.id })
         assertTrue(queryCalls > 0)
@@ -82,7 +82,7 @@ class PoolRelayIoTest {
         val events = (0 until 5).map { i -> event.copy(id = i.toString().repeat(64), createdAt = 100L + i) }
         val stranger = event.copy(id = "9".repeat(64), createdAt = 999, pubkey = "c".repeat(64))
         val pool = FakePool(queryImpl = { _, _ -> events + stranger })
-        val io = PoolRelayIo(pool)
+        val io = PoolRelayIo(pool, verify = { true })
         val many = io.fetchMany(NostrFilter(kinds = listOf(21237), limit = 2), listOf("wss://r.example"), event.pubkey)
         assertEquals(2, many.size)
         assertTrue(many.all { it.pubkey == event.pubkey })
@@ -96,7 +96,7 @@ class PoolRelayIoTest {
             "wss://b.example" to event.copy(id = "b".repeat(64), createdAt = 9),
         )
         val pool = FakePool(getImpl = { relay, _ -> perRelay[relay] })
-        val io = PoolRelayIo(pool)
+        val io = PoolRelayIo(pool, verify = { true })
         val many = io.fetchMany(NostrFilter(kinds = listOf(21237), limit = 10), listOf("wss://a.example", "wss://b.example"))
         assertEquals(listOf("b".repeat(64), "a".repeat(64)), many.map { it.id })
     }
@@ -104,21 +104,21 @@ class PoolRelayIoTest {
     @Test
     fun `resolves fetchMany to an empty list when every relay times out or throws`() = runTest {
         val pool = FakePool(queryImpl = { _, _ -> throw RuntimeException("offline") })
-        val io = PoolRelayIo(pool, timeoutMs = 10)
+        val io = PoolRelayIo(pool, timeoutMs = 10, verify = { true })
         assertEquals(emptyList(), io.fetchMany(NostrFilter(kinds = listOf(21237)), listOf("wss://r.example")))
     }
 
     @Test
     fun `resolves publish true when at least one relay accepts`() = runTest {
         val pool = FakePool(publishImpl = { relay, _ -> if (relay == "wss://a.example") throw RuntimeException("rejected") })
-        val io = PoolRelayIo(pool)
+        val io = PoolRelayIo(pool, verify = { true })
         assertTrue(io.publish(event, listOf("wss://a.example", "wss://b.example")))
     }
 
     @Test
     fun `resolves publish false when every relay rejects`() = runTest {
         val pool = FakePool(publishImpl = { _, _ -> throw RuntimeException("no") })
-        val io = PoolRelayIo(pool)
+        val io = PoolRelayIo(pool, verify = { true })
         assertFalse(io.publish(event, listOf("wss://a.example")))
     }
 
@@ -146,7 +146,7 @@ class PoolRelayIoTest {
         val older = event.copy(id = "1".repeat(64), createdAt = 3)
         val newer = event.copy(id = "2".repeat(64), createdAt = 5)
         val pool = FakePool(getImpl = { relay, _ -> if (relay == "wss://a.example") older else newer })
-        val io = PoolRelayIo(pool)
+        val io = PoolRelayIo(pool, verify = { true })
         val result = io.fetchNewest(NostrFilter(kinds = listOf(30078)), listOf("wss://a.example", "wss://b.example"), event.pubkey)
         assertEquals(newer, result)
     }
@@ -156,7 +156,7 @@ class PoolRelayIoTest {
         val highId = event.copy(id = "f".repeat(64), createdAt = 5)
         val lowId = event.copy(id = "0".repeat(64), createdAt = 5)
         val pool = FakePool(getImpl = { relay, _ -> if (relay == "wss://a.example") highId else lowId })
-        val io = PoolRelayIo(pool)
+        val io = PoolRelayIo(pool, verify = { true })
         val result = io.fetchNewest(NostrFilter(kinds = listOf(30078)), listOf("wss://a.example", "wss://b.example"), event.pubkey)
         assertEquals(lowId, result)
     }
@@ -164,7 +164,7 @@ class PoolRelayIoTest {
     @Test
     fun `bounds fetchNewest to timeoutMs and resolves null on a stalling relay`() = runTest {
         val pool = FakePool(getImpl = { _, _ -> CompletableDeferred<SignedNostrEvent?>().await() })
-        val io = PoolRelayIo(pool, timeoutMs = 5000)
+        val io = PoolRelayIo(pool, timeoutMs = 5000, verify = { true })
         val result = io.fetchNewest(NostrFilter(kinds = listOf(30078)), listOf("wss://r.example"))
         assertNull(result)
         assertEquals(5000L, currentTime)
@@ -173,7 +173,7 @@ class PoolRelayIoTest {
     @Test
     fun `clears the timer immediately when a relay answers before the timeout`() = runTest {
         val pool = FakePool(getImpl = { _, _ -> event })
-        val io = PoolRelayIo(pool, timeoutMs = 5000)
+        val io = PoolRelayIo(pool, timeoutMs = 5000, verify = { true })
         val result = io.fetchNewest(NostrFilter(kinds = listOf(30078)), listOf("wss://r.example"), event.pubkey)
         assertEquals(event, result)
         assertTrue(currentTime < 5000L)
@@ -182,7 +182,7 @@ class PoolRelayIoTest {
     @Test
     fun `bounds publish to timeoutMs and resolves false when every relay stalls`() = runTest {
         val pool = FakePool(publishImpl = { _, _ -> CompletableDeferred<Unit>().await() })
-        val io = PoolRelayIo(pool, timeoutMs = 4000)
+        val io = PoolRelayIo(pool, timeoutMs = 4000, verify = { true })
         val result = io.publish(event, listOf("wss://a.example"))
         assertFalse(result)
         assertEquals(4000L, currentTime)
@@ -191,14 +191,14 @@ class PoolRelayIoTest {
     @Test
     fun `resolves publish true when one relay answers before the timeout and another stalls`() = runTest {
         val pool = FakePool(publishImpl = { relay, _ -> if (relay == "wss://a.example") CompletableDeferred<Unit>().await() })
-        val io = PoolRelayIo(pool, timeoutMs = 4000)
+        val io = PoolRelayIo(pool, timeoutMs = 4000, verify = { true })
         assertTrue(io.publish(event, listOf("wss://a.example", "wss://b.example")))
     }
 
     @Test
     fun `throws synchronously for a relay URL that is neither wss nor loopback ws`() = runTest {
         val pool = FakePool()
-        val io = PoolRelayIo(pool)
+        val io = PoolRelayIo(pool, verify = { true })
         assertFailsWith<IllegalArgumentException> { io.fetchNewest(NostrFilter(kinds = listOf(30078)), listOf("http://evil.example")) }
         assertFailsWith<IllegalArgumentException> { io.publish(event, listOf("ws://evil.example")) }
         assertFailsWith<IllegalArgumentException> { io.subscribe(NostrFilter(kinds = listOf(30078)), listOf("ws://192.168.1.1")) {} }
@@ -207,10 +207,34 @@ class PoolRelayIoTest {
     @Test
     fun `accepts wss and loopback ws relays`() = runTest {
         val pool = FakePool(getImpl = { _, _ -> null })
-        val io = PoolRelayIo(pool)
+        val io = PoolRelayIo(pool, verify = { true })
         assertNull(io.fetchNewest(NostrFilter(kinds = listOf(30078)), listOf("ws://localhost:4869")))
         assertNull(io.fetchNewest(NostrFilter(kinds = listOf(30078)), listOf("ws://127.0.0.1:4869")))
         assertNull(io.fetchNewest(NostrFilter(kinds = listOf(30078)), listOf("wss://relay.example")))
+    }
+
+    @Test
+    fun `fetchNewest rejects a forged far-future event and keeps the honest relay's newer answer`() = runTest {
+        // Relay A is malicious: it answers with an event whose created_at is
+        // ten years past "now" and a signature that does not check out.
+        // Relay B is honest and merely newer than anything else honest, well
+        // short of relay A's fake future timestamp.
+        val now = 1_700_000_000L
+        val tenYearsInSeconds = 315_360_000L
+        val forged = event.copy(id = "f".repeat(64), createdAt = now + tenYearsInSeconds, sig = "bad".padEnd(128, '0'))
+        val honest = event.copy(id = "2".repeat(64), createdAt = now + 100)
+        val pool = FakePool(getImpl = { relay, _ -> if (relay == "wss://a.example") forged else honest })
+        val verifier: (SignedNostrEvent) -> Boolean = { it.id != forged.id }
+
+        val verifying = PoolRelayIo(pool, verify = verifier)
+        val result = verifying.fetchNewest(NostrFilter(kinds = listOf(30078)), listOf("wss://a.example", "wss://b.example"), event.pubkey)
+        assertEquals(honest, result)
+
+        // Proves the test is discriminating: without verification (or with a
+        // verifier that accepts everything), the forged, far-future event wins.
+        val trusting = PoolRelayIo(pool, verify = { true })
+        val unsafeResult = trusting.fetchNewest(NostrFilter(kinds = listOf(30078)), listOf("wss://a.example", "wss://b.example"), event.pubkey)
+        assertEquals(forged, unsafeResult)
     }
 
     // TS also had "never rejects, and clears the timer, when the pool returns

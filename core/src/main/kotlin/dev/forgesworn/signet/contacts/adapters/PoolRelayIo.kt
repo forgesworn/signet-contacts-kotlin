@@ -44,14 +44,19 @@ private const val MAX_FETCH_MANY_LIMIT = 100
  * this adapter, not the pool, decides which answer is newest: highest
  * `created_at`, a same-second tie going to the LOWEST id.
  *
- * @param verify when given, every event is checked with it and dropped on
- *   false. Pass the `nostr` module's signature check unless the pool already
- *   verifies; [RelayIo] requires verified events.
+ * @param verify every event is checked with it and dropped on false.
+ *   Required, not optional: a relay in the pool can forge an event with a
+ *   far-future `created_at` and a bogus signature to win [fetchNewest],
+ *   burying an honest relay's newer projection, block or revocation behind a
+ *   fake that never actually happened. Pass the `nostr` module's signature
+ *   check (e.g. `NostrEvents::verify`) unless the pool already verifies
+ *   signatures before events reach this adapter - in that case pass `{ true }`
+ *   explicitly; that is a deliberate, documented opt-out, not the default.
  */
 public class PoolRelayIo(
     private val pool: RelayPool,
     private val timeoutMs: Long = DEFAULT_RELAY_TIMEOUT_MS,
-    private val verify: ((SignedNostrEvent) -> Boolean)? = null,
+    private val verify: (SignedNostrEvent) -> Boolean,
 ) : RelayIo {
     /** A bad relay list is a caller bug, not a transient failure, so it throws. */
     private fun assertValidRelays(relays: List<String>) {
@@ -70,7 +75,7 @@ public class PoolRelayIo(
 
     private fun accept(event: SignedNostrEvent, author: String?): Boolean {
         if (author != null && !event.pubkey.equals(author, ignoreCase = true)) return false
-        return verify?.let { v -> runCatching { v(event) }.getOrDefault(false) } ?: true
+        return runCatching { verify(event) }.getOrDefault(false)
     }
 
     private fun newer(a: SignedNostrEvent, b: SignedNostrEvent): Boolean =

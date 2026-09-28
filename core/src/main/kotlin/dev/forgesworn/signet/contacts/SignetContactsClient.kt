@@ -49,13 +49,18 @@ import dev.forgesworn.signet.contacts.wire.proposalEventTemplate
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import java.util.concurrent.CopyOnWriteArraySet
 import kotlin.coroutines.cancellation.CancellationException
@@ -98,8 +103,16 @@ private suspend inline fun <T> orElse(fallback: T, block: () -> T): T = try {
  * @param nowMs ms clock a `rename-app-label` with no `updatedAt` is stamped from.
  * @param elapsedMs the clock deadlines and live-delivery gaps are measured on.
  *   Separate from [nowMs] so a test can pin the LWW stamp without freezing
- *   every deadline, and can drive it from a virtual-time scheduler.
- * @param scope where [start]'s poll loop and pushed ingests run.
+ *   every deadline, and can drive it from a virtual-time scheduler. Monotonic
+ *   by default (`System.nanoTime`), not wall-clock time, because a deadline or
+ *   a live-delivery gap must never appear to run backward across a system
+ *   clock step (NTP sync, DST, the user changing the date). On Android, pass
+ *   `SystemClock::elapsedRealtime` instead so the clock keeps running
+ *   correctly across doze/sleep the way `nanoTime` does not.
+ * @param scope where [start]'s poll loop and pushed ingests run. When left at
+ *   its default, the client creates and owns this scope, and [close] cancels
+ *   it. When a scope is injected, the CALLER owns it: the client never
+ *   cancels a scope it did not create, and [close] leaves it running.
  */
 public class SignetContactsClient(
     private val signer: ContactsSigner,
@@ -108,9 +121,12 @@ public class SignetContactsClient(
     private val now: () -> Long = { System.currentTimeMillis() / 1000 },
     private val nowMs: () -> Long = System::currentTimeMillis,
     private val maxPendingStalenessSeconds: Long = DEFAULT_PENDING_STALENESS_SECONDS,
-    private val elapsedMs: () -> Long = System::currentTimeMillis,
-    private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default),
+    private val elapsedMs: () -> Long = { System.nanoTime() / 1_000_000 },
+    scope: CoroutineScope? = null,
 ) {
+    private val ownsScope: Boolean = scope == null
+    private val scope: CoroutineScope = scope ?: CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
     @Volatile private var state: ContactsState = emptyContactsState()
     @Volatile private var pending: List<PendingProposal> = emptyList()
     @Volatile private var revokedAnnounced = false
@@ -121,10 +137,24 @@ public class SignetContactsClient(
     private val lock = Mutex()
 
     private val liveLock = Any()
-    private var unsubscribe: RelaySubscription? = null
+    @Volatile private var unsubscribe: RelaySubscription? = null
     private var pollJob: Job? = null
+
+    /** The current run's [SupervisorJob]: every ingest launched by [start] - both
+     *  the live push path and the poll fallback - runs as a child of this job, so
+     *  [stop] cancelling it cancels every in-flight ingest along with the poll
+     *  loop, rather than letting a suspended ingest finish and write [state]
+     *  after the caller believed the client had stopped. */
+    private var runJob: Job? = null
     private var liveGeneration = 0L
-    @Volatile private var lastLiveDeliveryMs = 0L
+    // null = no delivery yet THIS run. `elapsedMs` is nanoTime-based: an arbitrary,
+    // possibly-negative origin, so 0 cannot stand in for "never delivered" - it could
+    // coincide with, or fall arbitrarily close to, a real reading and wrongly skip the
+    // very first poll tick before the socket has ever actually delivered anything.
+    @Volatile private var lastLiveDeliveryMs: Long? = null
+
+    /** True once [close] has run. A closed client never opens another subscription. */
+    @Volatile private var closed = false
 
     // ------------------------------------------------------------------
     // Pairing
@@ -262,37 +292,64 @@ public class SignetContactsClient(
         ingestProjectionEvent(pairing, event)
     }
 
-    /** The whole acceptance path for ONE projection event, shared by fetch and live. */
-    private suspend fun ingestProjectionEvent(pairing: PairingV2, event: SignedNostrEvent): ContactProjectionV2? = lock.withLock {
-        orElse(null) {
-            // Author pin: a projection not signed by this grant's rail is not this grant's.
-            if (!event.pubkey.equals(pairing.railPubkey, ignoreCase = true)) return@orElse null
-            if (event.content.length > MAX_ENVELOPE_CHARS) return@orElse null
-            // R-4: the content is a v2 vault envelope, never a bare NIP-44 payload.
-            val plaintext = openVaultPayload(event.content, signer, pairing.railPubkey) ?: return@orElse null
-            val projection = parseProjection(plaintext) ?: return@orElse null
-            if (projection.grantId != pairing.grantId) return@orElse null
-            // The grant's capabilities are a ceiling on what a projection may claim.
-            if (projection.scopes.any { it !in pairing.grantedCapabilities }) return@orElse null
-            // And its clamped staleness is a ceiling on the projection's window.
-            if (projection.expiresAt - projection.issuedAt > pairing.maxStalenessSeconds) return@orElse null
+    /**
+     * The whole acceptance path for ONE projection event, shared by fetch and
+     * live. Revocation listeners are gathered under [lock] but invoked only
+     * after it is released (see [onRevoked]): a listener that itself calls
+     * back into a method taking [lock] - `load`, another ingest - would
+     * otherwise deadlock against the ingest that is calling it.
+     */
+    private suspend fun ingestProjectionEvent(pairing: PairingV2, event: SignedNostrEvent): ContactProjectionV2? {
+        var revokedGrantId: String? = null
+        val result = lock.withLock {
+            // A cancelled ingest that only just won the lock (e.g. `stop()` ran
+            // while this coroutine was suspended waiting for it) must not go on
+            // to read-modify-write `state`.
+            currentCoroutineContext().ensureActive()
+            orElse(null) {
+                // Author pin: a projection not signed by this grant's rail is not this grant's.
+                if (!event.pubkey.equals(pairing.railPubkey, ignoreCase = true)) return@orElse null
+                if (event.content.length > MAX_ENVELOPE_CHARS) return@orElse null
+                // R-4: the content is a v2 vault envelope, never a bare NIP-44 payload.
+                val plaintext = openVaultPayload(event.content, signer, pairing.railPubkey) ?: return@orElse null
+                val projection = parseProjection(plaintext) ?: return@orElse null
+                if (projection.grantId != pairing.grantId) return@orElse null
+                // The grant's capabilities are a ceiling on what a projection may claim.
+                if (projection.scopes.any { it !in pairing.grantedCapabilities }) return@orElse null
+                // And its clamped staleness is a ceiling on the projection's window.
+                if (projection.expiresAt - projection.issuedAt > pairing.maxStalenessSeconds) return@orElse null
 
-            val nowSec = now()
-            val next = applyProjection(state, projection, nowSec)
-            if (next === state) return@orElse null // the frontier rule rejected it
-            state = next
-            // Tracks state.revoked rather than latching, so each rising edge announces once.
-            val alreadyAnnounced = revokedAnnounced
-            revokedAnnounced = next.revoked
-            reconcilePending(projection, nowSec)
-            persistState()
-            persistPending(pairing.grantId)
-            if (next.revoked && !alreadyAnnounced) {
-                // Each listener is isolated: one that throws cannot silence the rest.
-                for (cb in revokedListeners) runCatching { cb(next.grantId ?: projection.grantId) }
+                val nowSec = now()
+                val next = applyProjection(state, projection, nowSec)
+                if (next === state) return@orElse null // the frontier rule rejected it
+                // Past this point a commit begins. One more check right before it, then
+                // the commit itself runs uncancellably: decrypt and validation above may
+                // have crossed suspension points, but once we are about to write `state`
+                // this ingest either fully lands - state, storage and the revocation
+                // announcement - or (if cancelled before this line) not at all. Never half.
+                currentCoroutineContext().ensureActive()
+                withContext(NonCancellable) {
+                    state = next
+                    // Tracks state.revoked rather than latching, so each rising edge announces once.
+                    val alreadyAnnounced = revokedAnnounced
+                    revokedAnnounced = next.revoked
+                    reconcilePending(projection, nowSec)
+                    persistState()
+                    persistPending(pairing.grantId)
+                    if (next.revoked && !alreadyAnnounced) revokedGrantId = next.grantId ?: projection.grantId
+                }
+                projection
             }
-            projection
         }
+        // Fired outside `lock`: see the KDoc above and on `onRevoked`. Guarded against
+        // the current state: another ingest may have won the lock after this one, and
+        // committed a non-revoked state, before this listener collection runs.
+        revokedGrantId?.let { grantId ->
+            if (!state.revoked) return@let
+            // Each listener is isolated: one that throws cannot silence the rest.
+            for (cb in revokedListeners) runCatching { cb(grantId) }
+        }
+        return result
     }
 
     /** R-9: an add-ken clears when a projection carries that pubkey; a rename clears
@@ -335,25 +392,36 @@ public class SignetContactsClient(
      * as the fallback. One subscription per client: a second call replaces
      * the first. The returned function tears down only while THIS
      * subscription is still current, so a late cleanup is inert.
+     *
+     * @throws IllegalStateException if [close] has already run: a closed client's
+     *   scope may already be cancelled, so a subscription opened here would never
+     *   be torn down.
      */
     public fun start(pairing: PairingV2, pollMs: Long = DEFAULT_LIVE_POLL_MS): () -> Unit {
+        check(!closed) { "client is closed" }
         val generation: Long
         val filter = projectionFilter(pairing.railPubkey, pairing.grantId)
         synchronized(liveLock) {
             stopLiveLocked()
             generation = liveGeneration
-            lastLiveDeliveryMs = 0
+            lastLiveDeliveryMs = null
+            // Every ingest this run launches - pushed or polled - is a child of
+            // THIS job, so `stop`/`close` cancelling it tears down every
+            // in-flight ingest along with the poll loop in one place.
+            val job = SupervisorJob(scope.coroutineContext[Job])
+            runJob = job
             unsubscribe = runCatching {
                 relay.subscribe(filter, listOf(pairing.relay)) { event ->
                     lastLiveDeliveryMs = elapsedMs()
-                    scope.launch { orElse(null) { ingestProjectionEvent(pairing, event) } }
+                    scope.launch(job) { orElse(null) { ingestProjectionEvent(pairing, event) } }
                 }
             }.getOrNull()
-            pollJob = scope.launch {
+            pollJob = scope.launch(job) {
                 while (isActive) {
                     delay(pollMs)
                     // A socket that delivered within the last interval is plainly alive.
-                    if (unsubscribe != null && elapsedMs() - lastLiveDeliveryMs < pollMs) continue
+                    val delivery = lastLiveDeliveryMs
+                    if (unsubscribe != null && delivery != null && elapsedMs() - delivery < pollMs) continue
                     orElse(null) {
                         relay.fetchNewest(filter, listOf(pairing.relay), pairing.railPubkey)?.let { ingestProjectionEvent(pairing, it) }
                     }
@@ -365,9 +433,38 @@ public class SignetContactsClient(
         }
     }
 
-    /** Stop the live subscription and the poll. Idempotent. */
+    /**
+     * Stop the live subscription and the poll, and cancel every ingest still
+     * in flight from this run - a suspended ingest (e.g. waiting on a slow
+     * decrypt) never gets to finish and write [state] once the caller has
+     * called [stop]. Idempotent.
+     *
+     * This is NOT a barrier: an ingest that has already passed its final
+     * cancellation check, immediately before it commits (see
+     * `ingestProjectionEvent`), completes that commit in full - state, both
+     * storage keys and the announcement of a fresh revocation - even though
+     * this call has already returned. A consumer that needs a guarantee no
+     * more writes land after [stop] returns should instead cancel its own
+     * injected [scope] and join it.
+     */
     public fun stop() {
         synchronized(liveLock) { stopLiveLocked() }
+    }
+
+    /**
+     * Stop the client (see [stop]) and, if this client created its own
+     * [CoroutineScope] - the constructor's default, when no `scope` is
+     * injected - cancel that scope too. A scope the CALLER passed in is the
+     * caller's own to cancel; this client never cancels one it did not create.
+     *
+     * Idempotent, and terminal: [start] throws [IllegalStateException] after
+     * this has run, rather than opening a subscription on a client that may
+     * already have cancelled the scope meant to run it.
+     */
+    public fun close() {
+        closed = true
+        stop()
+        if (ownsScope) scope.cancel()
     }
 
     private fun stopLiveLocked() {
@@ -376,6 +473,9 @@ public class SignetContactsClient(
         unsubscribe = null
         pollJob?.cancel()
         pollJob = null
+        // Cancels every ingest still running under this generation, pushed or polled.
+        runJob?.cancel()
+        runJob = null
     }
 
     // ------------------------------------------------------------------
@@ -393,7 +493,18 @@ public class SignetContactsClient(
     /** R-9: proposals sent and not yet seen applied. Consumer-side only. */
     public fun pendingProposals(): List<PendingProposal> = pending.toList()
 
-    /** Called once per revocation edge. Returns an unsubscribe function. */
+    /**
+     * Called once per revocation edge. Returns an unsubscribe function.
+     *
+     * [cb] fires on whatever coroutine dispatcher ran the ingest that
+     * revoked the grant - [scope]'s dispatcher for a live push or a poll
+     * tick, or the caller's own for a direct [fetchProjection]. That is
+     * never guaranteed to be the main thread; an Android consumer must
+     * dispatch to main itself. [cb] runs after the ingest's lock is
+     * released, so it MAY safely call back into another method that takes
+     * the same lock (e.g. [load]) without deadlocking - but it must not
+     * block, since it runs inline on that dispatcher.
+     */
     public fun onRevoked(cb: (grantId: String) -> Unit): () -> Unit {
         revokedListeners.add(cb)
         return { revokedListeners.remove(cb) }
