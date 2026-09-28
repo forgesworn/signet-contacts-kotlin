@@ -3,8 +3,6 @@ plugins {
     `java-library`
 }
 
-base { archivesName.set("signet-contacts") }
-
 repositories { mavenCentral() }
 
 dependencies {

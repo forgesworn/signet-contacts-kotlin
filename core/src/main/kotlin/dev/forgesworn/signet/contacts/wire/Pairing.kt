@@ -16,7 +16,9 @@ private val HEX64 = Regex("^[0-9a-f]{64}$")
 internal val CHALLENGE_HEX = Regex("^[0-9a-fA-F]{$CHALLENGE_HEX_CHARS}$")
 
 private val WSS = Regex("^wss://", RegexOption.IGNORE_CASE)
-private val LOOPBACK_WS = Regex("^ws://(localhost|127\\.0\\.0\\.1)([:/]|$)", RegexOption.IGNORE_CASE)
+// `\z`, not `$`: Java's `$` also matches before a trailing newline, so
+// `ws://localhost\n` would pass where the reference refuses it.
+private val LOOPBACK_WS = Regex("^ws://(localhost|127\\.0\\.0\\.1)([:/]|\\z)", RegexOption.IGNORE_CASE)
 
 /** Production relays require TLS; plaintext is reserved for loopback
  *  development. Capped at [MAX_RELAY_LEN] (C-I7). */

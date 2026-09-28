@@ -1,0 +1,43 @@
+name: CI
+
+# Builds the port and runs every test, including the full conformance suite
+# from forgesworn/signet-contacts-conformance main. A conformance mismatch
+# fails the build; so does a missing vectors checkout.
+
+on:
+  push:
+    branches: [main, 'feat/**', 'fix/**', 'chore/**']
+  pull_request:
+    branches: [main]
+  repository_dispatch:
+    types: [conformance-updated]
+  schedule:
+    - cron: '23 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          repository: forgesworn/signet-contacts-conformance
+          ref: main
+          path: .conformance
+          persist-credentials: false
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: gradle/actions/setup-gradle@9c971963bec38e04b3d30dcc455b5382be2fdbfb # v6.3.0
+      - name: Build and test against the conformance vectors
+        run: ./gradlew build -PsignetContactsVectors=.conformance/vectors
+      - name: Record the conformance commit tested
+        if: always()
+        run: echo "Conformance vectors at $(git -C .conformance rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"

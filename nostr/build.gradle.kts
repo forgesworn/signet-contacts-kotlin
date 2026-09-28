@@ -3,12 +3,10 @@ plugins {
     `java-library`
 }
 
-base { archivesName.set("signet-contacts-nostr") }
-
 repositories { mavenCentral() }
 
 dependencies {
-    api(project(":core"))
+    api(project(":signet-contacts"))
     // The API half only. A consumer adds the native half for its platform:
     // secp256k1-kmp-jni-android on Android, secp256k1-kmp-jni-jvm on a desktop JVM.
     api("fr.acinq.secp256k1:secp256k1-kmp-jvm:0.19.0")
