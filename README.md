@@ -28,14 +28,28 @@ every vector there runs in this build, and a mismatch fails it.
 
 The split matches the TypeScript package, where nostr-tools is an optional peer
 dependency: an app that already has a signer and a relay pool never needs the
-second artefact. If you do use it, add the native half for your platform:
-`fr.acinq.secp256k1:secp256k1-kmp-jni-android` on Android,
-`secp256k1-kmp-jni-jvm` on a desktop JVM.
+second artefact. If you do use it, add the native half for your platform, at
+the version the nostr module compiles its API half against (`0.19.0`):
+`fr.acinq.secp256k1:secp256k1-kmp-jni-android:0.19.0` on Android,
+`fr.acinq.secp256k1:secp256k1-kmp-jni-jvm:0.19.0` on a desktop JVM.
+
+Packages: the client, `ContactsSigner`, `RelayIo` and `StorageIo` are in
+`dev.forgesworn.signet.contacts`; `PoolRelayIo` and `RelayPool` in
+`dev.forgesworn.signet.contacts.adapters`; the wire types, `Capability` and
+`DirectoryKind` in `dev.forgesworn.signet.contacts.wire`; `Json` in
+`dev.forgesworn.signet.contacts.json`; and, from the second artefact,
+`NostrEvents`, `LocalKeySigner` and `InviteMailbox` in
+`dev.forgesworn.signet.contacts.nostr`.
 
 ## Install
 
 There is no published release yet. Use a Gradle composite build against a
-checkout pinned to a commit:
+checkout pinned to a commit you have reviewed:
+
+```bash
+git clone https://github.com/forgesworn/signet-contacts-kotlin ../signet-contacts-kotlin
+git -C ../signet-contacts-kotlin checkout <commit>
+```
 
 ```kotlin
 // settings.gradle.kts
@@ -48,10 +62,82 @@ dependencies {
 }
 ```
 
-## Quick start
+`includeBuild` substitutes each dependency by group and artefact name, so the
+code you get is whatever the checkout contains. Keep `0.1.0`, the version the
+checkout declares in its `build.gradle.kts`. The native secp256k1 artefacts
+above are not part of the checkout: add them yourself if you use the nostr
+module.
+
+## Interfaces
+
+You supply a `ContactsSigner`, a `RelayPool` (wrapped by `PoolRelayIo`, which
+implements `RelayIo`) and, in any real app, a `StorageIo`. Signatures as
+declared in the source, KDoc omitted:
 
 ```kotlin
+// dev.forgesworn.signet.contacts
+interface ContactsSigner : SealEnvelopeBackend, OpenEnvelopeBackend {
+    val pubkey: String                                      // lowercase 64-hex x-only key
+    suspend fun signEvent(event: UnsignedNostrEvent): SignedNostrEvent
+    // inherited from SealEnvelopeBackend and OpenEnvelopeBackend (package ...wire):
+    //   suspend fun nip44Encrypt(peerPubkey: String, plaintext: String): String
+    //   suspend fun nip44Decrypt(peerPubkey: String, ciphertext: String): String
+}
+
+fun interface RelaySubscription { fun close() }             // closing twice is harmless
+
+interface RelayIo {                                         // PoolRelayIo implements this
+    suspend fun fetchNewest(filter: NostrFilter, relays: List<String>, author: String? = null): SignedNostrEvent?
+    suspend fun publish(event: SignedNostrEvent, relays: List<String>): Boolean   // true if at least one relay accepted
+    suspend fun fetchMany(filter: NostrFilter, relays: List<String>, author: String? = null): List<SignedNostrEvent>? = null
+    fun subscribe(filter: NostrFilter, relays: List<String>, onEvent: (SignedNostrEvent) -> Unit): RelaySubscription? = null
+}
+
+interface StorageIo {
+    suspend fun get(key: String): String?
+    suspend fun set(key: String, value: String)
+}
+
+// dev.forgesworn.signet.contacts.adapters
+interface RelayPool {                                       // what you wrap; note relays come first here
+    suspend fun get(relay: String, filter: NostrFilter): SignedNostrEvent?
+    suspend fun query(relay: String, filter: NostrFilter): List<SignedNostrEvent>? = null
+    suspend fun publish(relay: String, event: SignedNostrEvent)     // throws when the relay refuses
+    fun subscribe(relays: List<String>, filter: NostrFilter, onEvent: (SignedNostrEvent) -> Unit): RelaySubscription
+}
+
+class PoolRelayIo(
+    pool: RelayPool,
+    timeoutMs: Long = DEFAULT_RELAY_TIMEOUT_MS,             // 8000, per pool call
+    verify: (SignedNostrEvent) -> Boolean,                  // required
+) : RelayIo
+```
+
+`RelayIo.fetchMany` and `subscribe` return `null` by default, meaning "this
+transport cannot do it": the client then falls back to `fetchNewest` and to
+polling. `PoolRelayIo` implements all four methods. Each of them throws
+`IllegalArgumentException` for a relay that is not `wss://` (or `ws://localhost`
+/ `ws://127.0.0.1`); inside the client's own calls that reads as a `null` or
+`false` result.
+
+## Quick start
+
+`awaitPairingAck`, `fetchProjection` and `load` are `suspend` functions: run the
+block below inside a coroutine.
+
+```kotlin
+import dev.forgesworn.signet.contacts.ContactsSigner
+import dev.forgesworn.signet.contacts.SignetContactsClient
+import dev.forgesworn.signet.contacts.StorageIo
+import dev.forgesworn.signet.contacts.adapters.PoolRelayIo
+import dev.forgesworn.signet.contacts.nostr.NostrEvents   // artefact dev.forgesworn:signet-contacts-nostr
+import dev.forgesworn.signet.contacts.wire.Capability
+import dev.forgesworn.signet.contacts.wire.DirectoryKind
+import dev.forgesworn.signet.contacts.wire.randomHex      // a core export, not a placeholder
+
 val signer: ContactsSigner = yourSigner      // your app's OWN signer: NIP-46, a hardware signer, or a local key
+// NostrEvents is in dev.forgesworn:signet-contacts-nostr. A core-only app passes its
+// own verifier instead, or verify = { true } if its pool already checks signatures.
 val relay = PoolRelayIo(yourRelayPool, verify = NostrEvents::verify)
 // `verify` is required, not optional: without it, a relay in the pool could
 // forge an event with a far-future created_at and win fetchNewest, hiding an
@@ -68,27 +154,132 @@ val storage = object : StorageIo {
 val client = SignetContactsClient(signer, relay, storage)
 
 val capabilities = listOf(Capability.READ_DIRECTORY, Capability.BLOCKS_READ)
-val challenge = randomHex(16)
-val uri = client.buildPairingUri(
+val challenge = randomHex(16)  // 32 lowercase hex chars (128 bits), the length a challenge must be
+val uri = client.buildPairingUri(                 // String; throws IllegalArgumentException on bad input
     appName = "My App", capabilities = capabilities, directory = DirectoryKind.OWNER,
-    relay = "wss://relay.example.com", nowSec = System.currentTimeMillis() / 1000, challenge = challenge,
+    relay = "wss://relay.example.com", nowSec = System.currentTimeMillis() / 1000, challenge = challenge,  // nowSec: Long
 )
 showQrCode(uri) // the owner scans it in Signet
 
 // Narrowing only: an ack granting anything you did not ask for is refused.
-val pairing = client.awaitPairingAck(challenge, listOf("wss://relay.example.com"), requestedCapabilities = capabilities)
+val pairing = client.awaitPairingAck(challenge, listOf("wss://relay.example.com"), requestedCapabilities = capabilities)  // PairingV2?
 if (pairing != null) {
     savePairing(pairing.toJson().stringify())      // your own persistence; PairingV2.fromJson reads it back
-    client.load(pairing.grantId)                    // rehydrate state, Blocked set included
-    val projection = client.fetchProjection(pairing)
-    val blocked = client.getBlockedSet()            // apply at ingress AND at display
-    val waiting = client.pendingProposals()         // proposals sent, not yet applied
-    val stop = client.start(pairing)                // live updates + poll fallback
+    client.load(pairing.grantId)                    // ContactsState: rehydrate state, Blocked set included
+    val projection = client.fetchProjection(pairing)  // ContactProjectionV2?
+    val blocked = client.getBlockedSet()            // Set<String> of pubkeys; apply at ingress AND at display
+    val waiting = client.pendingProposals()         // List<PendingProposal>: sent, not yet applied
+    val stop = client.start(pairing)                // () -> Unit; live updates + poll fallback
 }
 ```
 
+**Results and failures.** Hostile or malformed relay data and storage failures
+never throw out of a public client method: they read as `null` or `false`.
+Cancellation still propagates as it does in Kotlin.
+
+- `awaitPairingAck` returns `null` on timeout (default `timeoutMs` is
+  `2 * PAIRING_FRESHNESS_SECONDS * 1000`, ten minutes), or once it has opened 32
+  distinct candidate acks without finding one for this challenge. There is no
+  denial signal: an ack that grants more than `requestedCapabilities`, or that
+  names your own key as the rail, is skipped and the wait carries on.
+  Cancelling the calling coroutine abandons the wait; it throws rather than
+  returning `null`.
+- `fetchProjection` returns `ContactProjectionV2?` and throws nothing but
+  cancellation. `null` means no acceptable projection: no event found, not
+  signed by the grant's rail, a bad envelope, a wrong grant id, a scope the
+  grant did not give, a window wider than the grant's `maxStalenessSeconds`, or
+  not newer than the one already held. A projection with `revoked = true` is
+  returned like any other.
+- `start` throws `IllegalStateException("client is closed")` after `close()`.
+- `PairingV2.fromJson(text)` returns `null` for anything it cannot validate.
+- `propose` returns `Boolean`; `false` leaves `pendingProposals()` untouched.
+
 On every later launch, reload the pairing yourself and call
 `client.load(pairing.grantId)` **before** `client.fetchProjection(pairing)`.
+
+### Relaunch, revocation and proposals
+
+Relaunch from a saved pairing. `PairingV2.fromJson` takes the saved string
+itself (it parses the JSON for you), so there is no `Json.parse` step:
+
+```kotlin
+import dev.forgesworn.signet.contacts.wire.PairingV2
+
+val pairing = PairingV2.fromJson(savedText)    // PairingV2?; null if the text is invalid
+    ?: return startPairingAgain()               // your own fallback: pair afresh
+client.load(pairing.grantId)                    // BEFORE fetchProjection; returns ContactsState
+val projection = client.fetchProjection(pairing)
+val stop = client.start(pairing)
+```
+
+React to revocation. `onRevoked` fires once per revocation edge and returns an
+unsubscribe function. The grant id is the only argument; keep the Blocked set
+applied afterwards, because revocation never un-blocks anybody:
+
+```kotlin
+val off = client.onRevoked { grantId ->         // cb: (grantId: String) -> Unit; returns () -> Unit
+    // runs on the ingest's dispatcher, not necessarily main; must not block
+    forgetGrant(grantId)                        // your own cleanup; keep applying getBlockedSet()
+}
+off()                                           // unsubscribe
+```
+
+Send a proposal. The grant must include `Capability.PROPOSE_ADD_KEN` (for
+`AddKen`) or `Capability.PROPOSE_RENAME_APP_LABEL` (for `RenameAppLabel`), so
+ask for it in `buildPairingUri`. `propose` returns `false`, with nothing
+recorded as pending, if a draft needs a capability that was not granted or
+anything fails to build, encrypt, sign or publish. It also resends whatever is
+still pending for the grant:
+
+```kotlin
+import dev.forgesworn.signet.contacts.wire.ContactProposalDraft
+
+val sent: Boolean = client.propose(              // suspend
+    pairing,
+    listOf(
+        ContactProposalDraft.AddKen(pubkey = someHexPubkey, displayName = "Sam"),
+        ContactProposalDraft.RenameAppLabel(contactId = someContactId, label = "Sam (work)"), // updatedAt defaults to nowMs()
+    ),
+)
+```
+
+Proposals are requests, not writes: Signet decides. A proposal stays in
+`pendingProposals()` until an accepted projection shows it applied (the pubkey
+for an add, the label for a rename), or until an accepted projection arrives
+after it is older than `maxPendingStalenessSeconds` (constructor parameter,
+default `DEFAULT_PENDING_STALENESS_SECONDS`, a week).
+
+### Capability and DirectoryKind values
+
+`Capability` (declaration order is binding: it is the order `scopes` and a
+grant screen use). `Capability.fromWire(token)` returns `null` for an unknown
+token, and `capability.wire` is the token below.
+
+| Enum value | Wire string |
+| --- | --- |
+| `READ_DIRECTORY` | `signet.contacts.read:directory` |
+| `READ_METHOD_PHONE` | `signet.contacts.read:method:phone` |
+| `READ_METHOD_EMAIL` | `signet.contacts.read:method:email` |
+| `READ_METHOD_WEBSITE` | `signet.contacts.read:method:website` |
+| `READ_METHOD_POSTAL_ADDRESS` | `signet.contacts.read:method:postal-address` |
+| `READ_METHOD_OTHER` | `signet.contacts.read:method:other` |
+| `READ_TIER` | `signet.contacts.read:tier` |
+| `READ_CHECKS` | `signet.contacts.read:checks` |
+| `READ_CHECK_RECORDS` | `signet.contacts.read:check-records` |
+| `READ_ROLES` | `signet.contacts.read:roles` |
+| `BLOCKS_READ` | `signet.contacts.blocks.read` |
+| `PROPOSE_ADD_KEN` | `signet.contacts.propose:add-ken` |
+| `PROPOSE_RENAME_APP_LABEL` | `signet.contacts.propose:rename-app-label` |
+| `INVITES_CREATE` | `signet.contacts.invites:create` |
+| `INVITES_RECEIVE` | `signet.contacts.invites:receive` |
+
+`DirectoryKind` (`DirectoryKind.fromWire(token)` returns `null` for an unknown
+token):
+
+| Enum value | Wire string |
+| --- | --- |
+| `OWNER` | `owner` |
+| `DEPENDANT` | `dependant` |
 
 `stop` (returned by `start`, or `client.stop()`) cancels the live subscription,
 the poll, and every ingest still in flight from that run, so a suspended
@@ -134,7 +325,7 @@ that revocation is not recall and Kin means close circle, not family.
 | `createSignetContactsClient({ ... })` | `SignetContactsClient(...)` with named arguments |
 | promises | `suspend` functions |
 | `AbortSignal` on `awaitPairingAck` | cancel the calling coroutine; cancellation propagates rather than returning `null` |
-| `now`, `nowMs` | the same, plus `elapsedMs` (the clock deadlines and live-delivery gaps are measured on) and `scope` (where `start()` runs), so tests can drive everything from a virtual-time scheduler |
+| `now`, `nowMs` | the same, plus `elapsedMs` (the clock deadlines and live-delivery gaps are measured on) and `scope` (where `start()` runs), so tests can drive everything from a virtual-time scheduler. The full constructor is `SignetContactsClient(signer: ContactsSigner, relay: RelayIo, storage: StorageIo = MemoryStorage(), now: () -> Long = { System.currentTimeMillis() / 1000 }, nowMs: () -> Long = System::currentTimeMillis, maxPendingStalenessSeconds: Long = DEFAULT_PENDING_STALENESS_SECONDS, elapsedMs: () -> Long = { System.nanoTime() / 1_000_000 }, scope: CoroutineScope? = null)`. `now` is seconds, `nowMs` and `elapsedMs` are milliseconds. `buildPairingUri` takes its own `nowSec: Long`, which is not read from `now` |
 | optional `RelayIo.fetchMany` / `subscribe` | default methods that return `null` for "not supported" |
 | capability strings | the `Capability` enum (`Capability.fromWire`, `.wire`); every other string union is an enum with a `wire` property |
 | `TypeError` from builders | `IllegalArgumentException` |
