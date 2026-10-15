@@ -5,7 +5,7 @@
 ## Artefacts
 
 - `dev.forgesworn:signet-contacts` (version `0.1.0`): the wire layer, `SignetContactsClient`, `AppInviteClient` and `PoolRelayIo`. Depends on kotlinx-coroutines only; crypto is the JDK's own.
-- `dev.forgesworn:signet-contacts-nostr` (version `0.1.0`): secp256k1 event signing and verification, NIP-44 v2, `LocalKeySigner` and `InviteMailbox`. Optional. Add the native half yourself: `fr.acinq.secp256k1:secp256k1-kmp-jni-android:0.19.0` on Android, `fr.acinq.secp256k1:secp256k1-kmp-jni-jvm:0.19.0` on a desktop JVM.
+- `dev.forgesworn:signet-contacts-nostr` (version `0.1.0`): secp256k1 event signing and verification, NIP-44 v2, `LocalKeySigner` and `InviteMailbox`. Optional. Add the native half yourself: `fr.acinq.secp256k1:secp256k1-kmp-jni-android:0.19.0` on Android, `fr.acinq.secp256k1:secp256k1-kmp-jni-jvm:0.19.0` on a desktop JVM. Its classes are Java 8 bytecode and run on JVM 17, but its Gradle module metadata declares JVM 21, so a Gradle build targeting JVM 17 must either use a JDK 21 target or set `TargetJvmVersion.TARGET_JVM_VERSION_ATTRIBUTE` to 21 on the classpaths that resolve it (see the README, Modules).
 
 ## Public types
 

@@ -18,9 +18,14 @@ git clone https://github.com/forgesworn/signet-contacts-conformance ../signet-co
   read from `../signet-contacts-conformance/vectors` by default, set in
   `gradle.properties`). A missing vectors checkout fails the build; it never skips.
 - JDK: CI builds and tests on Temurin 21, because the `nostr` tests use
-  `secp256k1-kmp-jni-jvm`, which publishes for JVM 21. The artefacts themselves
-  emit JVM 17 bytecode, and the language and API level is pinned to Kotlin 2.0,
-  so consumers need JVM 17 and Kotlin 2.0 or later.
+  `secp256k1-kmp-jni-jvm`, whose Gradle module metadata declares JVM 21 (its
+  classes are Java 8 bytecode). `nostr/build.gradle.kts` pins the test
+  classpaths to 21 so that resolves. The artefacts themselves emit JVM 17
+  bytecode, and the language and API level is pinned to Kotlin 2.0, so
+  consumers need JVM 17 and Kotlin 2.0 or later. The one exception is Gradle
+  resolution of `secp256k1-kmp-jni-jvm` on a desktop JVM: a build targeting
+  JVM 17 must use a JDK 21 target or the same attribute override (README,
+  "Modules").
 - Both modules use `explicitApi()`: every public declaration needs an explicit
   `public` modifier.
 - Keep `core` free of any Nostr or secp256k1 dependency. Anything that needs

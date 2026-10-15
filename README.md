@@ -33,6 +33,14 @@ the version the nostr module compiles its API half against (`0.19.0`):
 `fr.acinq.secp256k1:secp256k1-kmp-jni-android:0.19.0` on Android,
 `fr.acinq.secp256k1:secp256k1-kmp-jni-jvm:0.19.0` on a desktop JVM.
 
+One Gradle caveat on the desktop JVM: the classes behind
+`secp256k1-kmp-jni-jvm` are Java 8 bytecode and run on JVM 17, but its Gradle
+module metadata declares JVM 21. A Gradle build that targets JVM 17 refuses to
+resolve it ("no matching variant"). Either build with a JDK 21 target, or set
+`TargetJvmVersion.TARGET_JVM_VERSION_ATTRIBUTE` to 21 on the classpaths that
+resolve it, as the `nostr` test classpaths in this repository do
+(`nostr/build.gradle.kts`). `secp256k1-kmp-jni-android` is not affected.
+
 Packages: the client, `ContactsSigner`, `RelayIo` and `StorageIo` are in
 `dev.forgesworn.signet.contacts`; `PoolRelayIo` and `RelayPool` in
 `dev.forgesworn.signet.contacts.adapters`; the wire types, `Capability` and
