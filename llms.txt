@@ -1,0 +1,57 @@
+# signet-contacts-kotlin
+
+> A Kotlin port of signet-contacts: the v2 wire for application access to a Signet contact directory. Capability-scoped pairing, a per-grant encrypted projection the owner controls, and a proposal channel for an app to ask (never demand) for a contact to be added or relabelled. A consumer SDK for the JVM (17 bytecode) and Android, held to the TypeScript reference by the signet-contacts-conformance vectors. Not published yet: use a Gradle composite build (`includeBuild`) against a pinned checkout.
+
+## Artefacts
+
+- `dev.forgesworn:signet-contacts` (version `0.1.0`): the wire layer, `SignetContactsClient`, `AppInviteClient` and `PoolRelayIo`. Depends on kotlinx-coroutines only; crypto is the JDK's own.
+- `dev.forgesworn:signet-contacts-nostr` (version `0.1.0`): secp256k1 event signing and verification, NIP-44 v2, `LocalKeySigner` and `InviteMailbox`. Optional. Add the native half yourself: `fr.acinq.secp256k1:secp256k1-kmp-jni-android:0.19.0` on Android, `fr.acinq.secp256k1:secp256k1-kmp-jni-jvm:0.19.0` on a desktop JVM. Its classes are Java 8 bytecode and run on JVM 17, but its Gradle module metadata declares JVM 21, so a Gradle build targeting JVM 17 must either use a JDK 21 target or set `TargetJvmVersion.TARGET_JVM_VERSION_ATTRIBUTE` to 21 on the classpaths that resolve it (see the README, Modules).
+
+## Public types
+
+Package `dev.forgesworn.signet.contacts`:
+- `SignetContactsClient`: `buildPairingUri`, `awaitPairingAck`, `load`, `fetchProjection`, `getBlockedSet`, `pendingProposals`, `propose`, `onRevoked`, `start`, `stop`, `close`
+- `AppInviteClient`: `requestInvite`, `handOverInvite`
+- `ContactsSigner`: the app's own signer (`pubkey`, `signEvent`, `nip44Encrypt`, `nip44Decrypt`)
+- `RelayIo`: relay I/O (`fetchNewest`, `publish`, optional `fetchMany` and `subscribe`)
+- `StorageIo`: `get` and `set`; `MemoryStorage` is the in-memory default
+
+Package `dev.forgesworn.signet.contacts.adapters`:
+- `RelayPool`: the per-relay primitives you wrap
+- `PoolRelayIo(pool, timeoutMs, verify)`: implements `RelayIo` over a `RelayPool`; `verify` is required
+
+Package `dev.forgesworn.signet.contacts.wire`:
+- `Capability` (15 values, `.wire` and `Capability.fromWire`), `DirectoryKind` (`OWNER`, `DEPENDANT`)
+- `PairingV2` (`toJson()`, `PairingV2.fromJson(text: String)`), `ContactProposalDraft` (`AddKen`, `RenameAppLabel`)
+- `randomHex(bytes)`: `randomHex(16)` is a valid pairing challenge
+
+Package `dev.forgesworn.signet.contacts.json`:
+- `Json`: JavaScript-semantics JSON (`parse`, `parseOrNull`) used for every digest on the wire
+
+Package `dev.forgesworn.signet.contacts.nostr` (second artefact):
+- `NostrEvents` (`verify`, `finalize`, `eventId`), `NostrKeys`, `Nip44`
+- `LocalKeySigner(secretKey: ByteArray)`: a `ContactsSigner` over a local key
+- `InviteMailbox`: contact-exchange mailbox (`wrap`, `openMailboxWrap`, `openIdentityPacket`); `LocalIdentitySigner` for tests and tools
+
+## Rules that matter
+
+- Call `client.load(pairing.grantId)` before `client.fetchProjection(pairing)` on every launch.
+- Never un-block anyone because a projection expired or the grant was revoked.
+- Apply `getBlockedSet()` at ingress and at display.
+- `PoolRelayIo` needs a `verify`: use `NostrEvents::verify` from the nostr artefact, or `{ true }` only if the pool already verifies signatures.
+- `stop()` ends live updates; `close()` is terminal and `start()` throws `IllegalStateException` afterwards.
+
+## Docs
+
+- [README](https://github.com/forgesworn/signet-contacts-kotlin/blob/main/README.md)
+- [Modules and packages](https://github.com/forgesworn/signet-contacts-kotlin/blob/main/README.md#modules)
+- [Install](https://github.com/forgesworn/signet-contacts-kotlin/blob/main/README.md#install)
+- [Interfaces](https://github.com/forgesworn/signet-contacts-kotlin/blob/main/README.md#interfaces)
+- [Quick start, results and failures](https://github.com/forgesworn/signet-contacts-kotlin/blob/main/README.md#quick-start)
+- [Relaunch, revocation and proposals](https://github.com/forgesworn/signet-contacts-kotlin/blob/main/README.md#relaunch-revocation-and-proposals)
+- [Capability and DirectoryKind values](https://github.com/forgesworn/signet-contacts-kotlin/blob/main/README.md#capability-and-directorykind-values)
+- [Differences from the TypeScript API](https://github.com/forgesworn/signet-contacts-kotlin/blob/main/README.md#differences-from-the-typescript-api)
+- [Porting notes](https://github.com/forgesworn/signet-contacts-kotlin/blob/main/README.md#porting-notes)
+- [Tests](https://github.com/forgesworn/signet-contacts-kotlin/blob/main/README.md#tests)
+- [TypeScript reference](https://github.com/forgesworn/signet-contacts)
+- [Conformance vectors](https://github.com/forgesworn/signet-contacts-conformance)
