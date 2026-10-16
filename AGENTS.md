@@ -1,9 +1,15 @@
 # AGENTS.md
 
 Kotlin port of the signet-contacts v2 wire and consumer client. Two Gradle
-projects: `core` (artefact `dev.forgesworn:signet-contacts`) and `nostr`
-(artefact `dev.forgesworn:signet-contacts-nostr`). The TypeScript package is the
-reference; this port must match it on every conformance vector.
+projects, each named for the artefact it publishes while its directory stays
+short (`settings.gradle.kts`): `:signet-contacts` in `core/` (artefact
+`dev.forgesworn:signet-contacts`) and `:signet-contacts-nostr` in `nostr/`
+(artefact `dev.forgesworn:signet-contacts-nostr`). The group `dev.forgesworn`
+and version `0.1.0` are set for both in the root `build.gradle.kts`, so a
+composite build (`includeBuild`) substitutes `group:projectName` correctly. The
+rest of this file says `core` and `nostr` for the directories and modules. The
+TypeScript package is the reference; this port must match it on every
+conformance vector.
 
 ## Build and test
 

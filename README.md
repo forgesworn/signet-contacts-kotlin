@@ -70,11 +70,14 @@ dependencies {
 }
 ```
 
-`includeBuild` substitutes each dependency by group and artefact name, so the
-code you get is whatever the checkout contains. Keep `0.1.0`, the version the
-checkout declares in its `build.gradle.kts`. The native secp256k1 artefacts
-above are not part of the checkout: add them yourself if you use the nostr
-module.
+`includeBuild` substitutes each dependency by group and Gradle project name, so
+the code you get is whatever the checkout contains. The checkout names its
+projects after the artefacts (`:signet-contacts` and `:signet-contacts-nostr`,
+in the `core/` and `nostr/` directories) and sets the group `dev.forgesworn`
+for both, so the two coordinates above resolve to it. Keep `0.1.0`, the version
+the checkout declares in its root `build.gradle.kts`. The native secp256k1
+artefacts above are not part of the checkout: add them yourself if you use the
+nostr module.
 
 ## Interfaces
 
