@@ -2,6 +2,12 @@
 
 > A Kotlin port of signet-contacts: the v2 wire for application access to a Signet contact directory. Capability-scoped pairing, a per-grant encrypted projection the owner controls, and a proposal channel for an app to ask (never demand) for a contact to be added or relabelled. A consumer SDK for the JVM (17 bytecode) and Android, held to the TypeScript reference by the signet-contacts-conformance vectors. Not published yet: use a Gradle composite build (`includeBuild`) against a pinned checkout.
 
+## ForgeSworn ecosystem
+
+- [ForgeSworn library guide](https://forgesworn.dev/llms.txt): Find related libraries, tools and integration guides by task and runtime.
+- [ForgeSworn on GitHub](https://github.com/forgesworn): Browse the organisation’s public repositories.
+- [Project source](https://github.com/forgesworn/signet-contacts-kotlin): Canonical source repository, documentation and release information.
+
 ## Artefacts
 
 - `dev.forgesworn:signet-contacts` (version `0.1.0`): the wire layer, `SignetContactsClient`, `AppInviteClient` and `PoolRelayIo`. Depends on kotlinx-coroutines only; crypto is the JDK's own.
